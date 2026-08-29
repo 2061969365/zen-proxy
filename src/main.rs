@@ -92,10 +92,18 @@ async fn main() {
         .route("/", get(status_handler))
         .route("/health", get(status_handler))
         .route("/api/status", get(status_handler))
+        .route("/models", get(models_handler))
         .route("/v1/models", get(models_handler))
+        .route("/v1/v1/models", get(models_handler))
+        .route("/chat/completions", post(chat_completions_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/v1/chat/completions", post(chat_completions_handler))
+        .route("/responses", post(responses_handler))
         .route("/v1/responses", post(responses_handler))
+        .route("/v1/v1/responses", post(responses_handler))
+        .route("/messages", post(messages_handler))
         .route("/v1/messages", post(messages_handler))
+        .route("/v1/v1/messages", post(messages_handler))
         .layer(cors)
         .with_state(state);
 
