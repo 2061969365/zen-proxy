@@ -31,45 +31,29 @@ async fn main() {
     let user_agent = env::var("ZEN_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string());
     let host = env::var("HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
 
-    let specified_port = env::var("PORT").ok().and_then(|p| p.parse::<u16>().ok());
-
-    let (listener, actual_port) = match specified_port {
-        Some(port) => {
-            let bind_addr = format!("{}:{}", host, port);
-            match tokio::net::TcpListener::bind(&bind_addr).await {
-                Ok(l) => (l, port),
-                Err(e) => {
-                    eprintln!("❌ 端口绑定失败 ({}): {}", bind_addr, e);
-                    wait_for_keypress();
-                    return;
-                }
-            }
-        }
-        None => {
-            let mut port = DEFAULT_PORT;
-            let mut bound_listener = None;
-            while port <= DEFAULT_PORT + 20 {
-                let bind_addr = format!("{}:{}", host, port);
-                match tokio::net::TcpListener::bind(&bind_addr).await {
-                    Ok(l) => {
-                        bound_listener = Some((l, port));
-                        break;
-                    }
-                    Err(_) => {
-                        port += 1;
-                    }
-                }
-            }
-            match bound_listener {
-                Some(res) => res,
-                None => {
-                    eprintln!("❌ 无法在 4096~4116 找到可用端口（均被占用）");
-                    wait_for_keypress();
-                    return;
-                }
-            }
-        }
+    let target_ports = match specified_port {
+        Some(port) => vec![port],
+        None => vec![4096, 4097, 4098, 4099],
     };
+
+    let mut bound_listeners = Vec::new();
+    let mut bound_ports = Vec::new();
+
+    for &port in &target_ports {
+        let bind_addr = format!("{}:{}", host, port);
+        if let Ok(listener) = tokio::net::TcpListener::bind(&bind_addr).await {
+            bound_ports.push(port);
+            bound_listeners.push(listener);
+        }
+    }
+
+    if bound_listeners.is_empty() {
+        eprintln!("❌ 无法在 4096~4099 绑定任何端口（均被占用）");
+        wait_for_keypress();
+        return;
+    }
+
+    let primary_port = bound_ports[0];
 
     let client = reqwest::Client::builder()
         .tcp_nodelay(true)
@@ -80,7 +64,7 @@ async fn main() {
         client,
         zen_base: zen_base.clone(),
         user_agent,
-        port: actual_port,
+        port: primary_port,
     });
 
     let cors = CorsLayer::new()
@@ -109,17 +93,26 @@ async fn main() {
 
     println!("\n=======================================================");
     println!("  🚀 Zen Proxy 服务已启动！");
-    println!("  - 本地地址: http://127.0.0.1:{}", actual_port);
-    println!("  - 接口 Base URL: http://127.0.0.1:{}/v1", actual_port);
-    println!("  - 状态检查: http://127.0.0.1:{}/api/status", actual_port);
+    let ports_str: Vec<String> = bound_ports.iter().map(|p| p.to_string()).collect();
+    println!("  - 已同时监听端口: {}", ports_str.join(", "));
+    for port in &bound_ports {
+        println!("    👉 http://127.0.0.1:{}/v1", port);
+    }
+    println!("  - 状态检查: http://127.0.0.1:{}/api/status", primary_port);
     println!("  - 上游服务: {}", zen_base);
     println!("=======================================================");
     println!("  [运行中] 按 Ctrl+C 可停止服务...\n");
 
-    if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("❌ 运行错误: {}", e);
-        wait_for_keypress();
+    let mut handles = Vec::new();
+    for listener in bound_listeners {
+        let app_clone = app.clone();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app_clone).await;
+        });
+        handles.push(handle);
     }
+
+    futures_util::future::join_all(handles).await;
 }
 
 fn wait_for_keypress() {
@@ -415,11 +408,18 @@ async fn handle_anthropic_to_openai_adapter(
         };
     }
 
-    let openai_payload = json!({
+    let mut openai_payload = json!({
         "model": model,
         "messages": openai_messages,
         "stream": false
     });
+
+    if let Some(tools) = payload.get("tools") {
+        openai_payload["tools"] = tools.clone();
+    }
+    if let Some(tc) = payload.get("tool_choice") {
+        openai_payload["tool_choice"] = tc.clone();
+    }
 
     let mut req = state
         .client
@@ -456,6 +456,57 @@ async fn handle_anthropic_to_openai_adapter(
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
 
+            let mut content_blocks = Vec::new();
+            let mut stop_reason = "end_turn";
+
+            if !text.is_empty() {
+                content_blocks.push(json!({
+                    "type": "text",
+                    "text": text
+                }));
+            }
+
+            if let Some(tool_calls) = resp_json
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c0| c0.get("message"))
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|t| t.as_array())
+            {
+                if !tool_calls.is_empty() {
+                    stop_reason = "tool_use";
+                    for tc in tool_calls {
+                        let call_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("call_zen");
+                        let func_name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("unknown");
+                        let func_args = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("{}");
+                        let parsed_input: Value =
+                            serde_json::from_str(func_args).unwrap_or_else(|_| json!({}));
+
+                        content_blocks.push(json!({
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": func_name,
+                            "input": parsed_input
+                        }));
+                    }
+                }
+            }
+
+            if content_blocks.is_empty() {
+                content_blocks.push(json!({
+                    "type": "text",
+                    "text": text
+                }));
+            }
+
             let input_tokens = resp_json
                 .get("usage")
                 .and_then(|u| u.get("prompt_tokens"))
@@ -468,8 +519,8 @@ async fn handle_anthropic_to_openai_adapter(
                 .unwrap_or(0);
 
             if is_stream {
-                let sse_events = format!(
-                    "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+                let mut sse_events = format!(
+                    "event: message_start\ndata: {}\n\n",
                     json!({
                         "type": "message_start",
                         "message": {
@@ -482,30 +533,38 @@ async fn handle_anthropic_to_openai_adapter(
                             "stop_sequence": null,
                             "usage": { "input_tokens": input_tokens, "output_tokens": 1 }
                         }
-                    }),
-                    json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": { "type": "text", "text": "" }
-                    }),
-                    json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": { "type": "text_delta", "text": text }
-                    }),
-                    json!({
-                        "type": "content_block_stop",
-                        "index": 0
-                    }),
-                    json!({
-                        "type": "message_delta",
-                        "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-                        "usage": { "output_tokens": output_tokens }
-                    }),
-                    json!({
-                        "type": "message_stop"
                     })
                 );
+
+                for (idx, block) in content_blocks.iter().enumerate() {
+                    let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+                    if block_type == "text" {
+                        let t = block.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                        sse_events.push_str(&format!(
+                            "event: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\n",
+                            json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "text", "text": "" } }),
+                            json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "text_delta", "text": t } }),
+                            json!({ "type": "content_block_stop", "index": idx })
+                        ));
+                    } else if block_type == "tool_use" {
+                        let call_id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                        let input_str = serde_json::to_string(&input).unwrap_or_default();
+                        sse_events.push_str(&format!(
+                            "event: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\n",
+                            json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "tool_use", "id": call_id, "name": name, "input": {} } }),
+                            json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "input_json_delta", "partial_json": input_str } }),
+                            json!({ "type": "content_block_stop", "index": idx })
+                        ));
+                    }
+                }
+
+                sse_events.push_str(&format!(
+                    "event: message_delta\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+                    json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": null }, "usage": { "output_tokens": output_tokens } }),
+                    json!({ "type": "message_stop" })
+                ));
 
                 return Response::builder()
                     .status(StatusCode::OK)
@@ -520,10 +579,8 @@ async fn handle_anthropic_to_openai_adapter(
                 "type": "message",
                 "role": "assistant",
                 "model": model,
-                "content": [
-                    { "type": "text", "text": text }
-                ],
-                "stop_reason": "end_turn",
+                "content": content_blocks,
+                "stop_reason": stop_reason,
                 "stop_sequence": null,
                 "usage": {
                     "input_tokens": input_tokens,
