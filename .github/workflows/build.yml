@@ -61,13 +61,17 @@ jobs:
 
   build-docker:
     name: Build & Push Docker Image
+    needs: [build-binaries]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Download Linux binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zen-proxy-linux-amd64
+          path: .
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
