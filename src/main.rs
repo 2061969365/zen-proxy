@@ -64,8 +64,8 @@ async fn main() {
             }
             match bound_listener {
                 Some(res) => res,
-                Err(e) => {
-                    eprintln!("❌ 无法在 4096~4116 找到可用端口: {}", e);
+                None => {
+                    eprintln!("❌ 无法在 4096~4116 找到可用端口（均被占用）");
                     wait_for_keypress();
                     return;
                 }
