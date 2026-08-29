@@ -30,6 +30,7 @@ async fn main() {
     let zen_base = env::var("ZEN_BASE").unwrap_or_else(|_| DEFAULT_ZEN_BASE.to_string());
     let user_agent = env::var("ZEN_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string());
     let host = env::var("HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
+    let specified_port = env::var("PORT").ok().and_then(|p| p.parse::<u16>().ok());
 
     let target_ports = match specified_port {
         Some(port) => vec![port],
