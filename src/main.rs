@@ -217,7 +217,6 @@ async fn messages_handler(
     let model = map_and_clean_model(&mut payload);
     let is_claude = model.starts_with("claude-");
 
-    // If native Claude model, forward directly to upstream /messages
     if is_claude {
         let mut req = state
             .client
@@ -238,8 +237,6 @@ async fn messages_handler(
         };
     }
 
-    // For non-Claude models (like mimo-v2.5-free, hy3-free, muse-spark, etc.),
-    // convert Anthropic /messages format -> OpenAI /chat/completions format so Claude Code works seamlessly
     handle_anthropic_to_openai_adapter(state, headers, payload, model).await
 }
 
@@ -256,7 +253,6 @@ async fn handle_anthropic_to_openai_adapter(
 
     let mut openai_messages = Vec::new();
 
-    // 1. Extract system prompt if present
     if let Some(sys) = payload.get("system") {
         if let Some(s) = sys.as_str() {
             openai_messages.push(json!({ "role": "system", "content": s }));
@@ -272,7 +268,6 @@ async fn handle_anthropic_to_openai_adapter(
         }
     }
 
-    // 2. Extract messages
     if let Some(messages) = payload.get("messages").and_then(|m| m.as_array()) {
         for msg in messages {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -282,8 +277,10 @@ async fn handle_anthropic_to_openai_adapter(
             } else if let Some(arr) = content_val.and_then(|c| c.as_array()) {
                 arr.iter()
                     .filter_map(|item| {
-                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            item.get("text").and_then(|t| t.as_str())
+                        if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                            Some(t.to_string())
+                        } else if let Some(tr) = item.get("content").and_then(|c| c.as_str()) {
+                            Some(tr.to_string())
                         } else {
                             None
                         }
@@ -298,7 +295,6 @@ async fn handle_anthropic_to_openai_adapter(
         }
     }
 
-    // 3. If muse-spark model
     if model.starts_with("muse-spark") {
         let input_text = openai_messages
             .iter()
@@ -338,6 +334,55 @@ async fn handle_anthropic_to_openai_adapter(
                             }
                         }
                     }
+
+                    if is_stream {
+                        let sse_events = format!(
+                            "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+                            json!({
+                                "type": "message_start",
+                                "message": {
+                                    "id": "msg_zen_muse",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "model": model,
+                                    "content": [],
+                                    "stop_reason": null,
+                                    "stop_sequence": null,
+                                    "usage": { "input_tokens": 10, "output_tokens": 1 }
+                                }
+                            }),
+                            json!({
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": { "type": "text", "text": "" }
+                            }),
+                            json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": { "type": "text_delta", "text": text_output }
+                            }),
+                            json!({
+                                "type": "content_block_stop",
+                                "index": 0
+                            }),
+                            json!({
+                                "type": "message_delta",
+                                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                                "usage": { "output_tokens": 50 }
+                            }),
+                            json!({
+                                "type": "message_stop"
+                            })
+                        );
+
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .header(header::CACHE_CONTROL, "no-cache")
+                            .body(Body::from(sse_events))
+                            .unwrap_or_default();
+                    }
+
                     let anthropic_response = json!({
                         "id": "msg_zen_muse",
                         "type": "message",
