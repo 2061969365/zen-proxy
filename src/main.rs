@@ -30,10 +30,48 @@ async fn main() {
     let zen_base = env::var("ZEN_BASE").unwrap_or_else(|_| DEFAULT_ZEN_BASE.to_string());
     let user_agent = env::var("ZEN_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string());
     let host = env::var("HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
-    let port: u16 = env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+    
+    // Check if port is specified by user via env
+    let specified_port = env::var("PORT").ok().and_then(|p| p.parse::<u16>().ok());
+
+    let (listener, actual_port) = match specified_port {
+        Some(port) => {
+            let bind_addr = format!("{}:{}", host, port);
+            match tokio::net::TcpListener::bind(&bind_addr).await {
+                Ok(l) => (l, port),
+                Err(e) => {
+                    eprintln!("❌ 端口绑定失败 ({}): {}", bind_addr, e);
+                    wait_for_keypress();
+                    return;
+                }
+            }
+        }
+        None => {
+            // Auto fallback: try 4096, 4097, 4098, 4099, 4100...
+            let mut port = DEFAULT_PORT;
+            let mut bound_listener = None;
+            while port <= DEFAULT_PORT + 20 {
+                let bind_addr = format!("{}:{}", host, port);
+                match tokio::net::TcpListener::bind(&bind_addr).await {
+                    Ok(l) => {
+                        bound_listener = Some((l, port));
+                        break;
+                    }
+                    Err(_) => {
+                        port += 1;
+                    }
+                }
+            }
+            match bound_listener {
+                Some(res) => res,
+                Err(e) => {
+                    eprintln!("❌ 无法在 4096~4116 找到可用端口: {}", e);
+                    wait_for_keypress();
+                    return;
+                }
+            }
+        }
+    };
 
     let client = reqwest::Client::builder()
         .tcp_nodelay(true)
@@ -42,9 +80,9 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client,
-        zen_base,
+        zen_base: zen_base.clone(),
         user_agent,
-        port,
+        port: actual_port,
     });
 
     let cors = CorsLayer::new()
@@ -63,19 +101,25 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let bind_addr = format!("{}:{}", host, port);
-    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Failed to bind to {}: {}", bind_addr, e);
-            return;
-        }
-    };
+    println!("\n=======================================================");
+    println!("  🚀 Zen Proxy 服务已启动！");
+    println!("  - 本地地址: http://127.0.0.1:{}", actual_port);
+    println!("  - 接口 Base URL: http://127.0.0.1:{}/v1", actual_port);
+    println!("  - 状态检查: http://127.0.0.1:{}/api/status", actual_port);
+    println!("  - 上游服务: {}", zen_base);
+    println!("=======================================================");
+    println!("  [运行中] 按 Ctrl+C 可停止服务...\n");
 
-    println!("zen-proxy listening on http://{}", bind_addr);
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("Server error: {}", e);
+        eprintln!("❌ 运行错误: {}", e);
+        wait_for_keypress();
     }
+}
+
+fn wait_for_keypress() {
+    println!("\n按回车键退出程序...");
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
 }
 
 async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
