@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -30,8 +30,7 @@ async fn main() {
     let zen_base = env::var("ZEN_BASE").unwrap_or_else(|_| DEFAULT_ZEN_BASE.to_string());
     let user_agent = env::var("ZEN_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string());
     let host = env::var("HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
-    
-    // Check if port is specified by user via env
+
     let specified_port = env::var("PORT").ok().and_then(|p| p.parse::<u16>().ok());
 
     let (listener, actual_port) = match specified_port {
@@ -47,7 +46,6 @@ async fn main() {
             }
         }
         None => {
-            // Auto fallback: try 4096, 4097, 4098, 4099, 4100...
             let mut port = DEFAULT_PORT;
             let mut bound_listener = None;
             while port <= DEFAULT_PORT + 20 {
@@ -141,7 +139,7 @@ async fn models_handler(
         .get(format!("{}/models", state.zen_base))
         .header("User-Agent", &state.user_agent);
 
-    req = attach_auth_headers(req, &headers);
+    req = attach_headers(req, &headers);
 
     match req.send().await {
         Ok(res) => forward_response(res),
@@ -158,18 +156,9 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     Json(mut payload): Json<Value>,
 ) -> impl IntoResponse {
-    // Clean model suffixes like [1m] or [128k]
-    clean_model_name(&mut payload);
+    let model = map_and_clean_model(&mut payload);
+    let is_muse = model.starts_with("muse-spark");
 
-    let model_str = payload
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let is_muse = model_str.starts_with("muse-spark");
-
-    // If muse-spark model and request uses standard messages format
     if is_muse && payload.get("input").is_none() && payload.get("messages").is_some() {
         return handle_muse_conversion(state, headers, payload).await;
     }
@@ -182,7 +171,7 @@ async fn chat_completions_handler(
         .header("Content-Type", "application/json")
         .json(&payload);
 
-    req = attach_auth_headers(req, &headers);
+    req = attach_headers(req, &headers);
 
     match req.send().await {
         Ok(res) => forward_response(res),
@@ -199,7 +188,7 @@ async fn responses_handler(
     headers: HeaderMap,
     Json(mut payload): Json<Value>,
 ) -> impl IntoResponse {
-    clean_model_name(&mut payload);
+    map_and_clean_model(&mut payload);
 
     let mut req = state
         .client
@@ -208,7 +197,7 @@ async fn responses_handler(
         .header("Content-Type", "application/json")
         .json(&payload);
 
-    req = attach_auth_headers(req, &headers);
+    req = attach_headers(req, &headers);
 
     match req.send().await {
         Ok(res) => forward_response(res),
@@ -224,23 +213,276 @@ async fn messages_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(mut payload): Json<Value>,
-) -> impl IntoResponse {
-    clean_model_name(&mut payload);
+) -> Response {
+    let model = map_and_clean_model(&mut payload);
+    let is_claude = model.starts_with("claude-");
+
+    // If native Claude model, forward directly to upstream /messages
+    if is_claude {
+        let mut req = state
+            .client
+            .post(format!("{}/messages", state.zen_base))
+            .header("User-Agent", &state.user_agent)
+            .header("Content-Type", "application/json")
+            .json(&payload);
+
+        req = attach_headers(req, &headers);
+
+        return match req.send().await {
+            Ok(res) => forward_response(res),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": { "message": format!("Upstream request failed: {}", e) } })),
+            )
+                .into_response(),
+        };
+    }
+
+    // For non-Claude models (like mimo-v2.5-free, hy3-free, muse-spark, etc.),
+    // convert Anthropic /messages format -> OpenAI /chat/completions format so Claude Code works seamlessly
+    handle_anthropic_to_openai_adapter(state, headers, payload, model).await
+}
+
+async fn handle_anthropic_to_openai_adapter(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    payload: Value,
+    model: String,
+) -> Response {
+    let is_stream = payload
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+
+    let mut openai_messages = Vec::new();
+
+    // 1. Extract system prompt if present
+    if let Some(sys) = payload.get("system") {
+        if let Some(s) = sys.as_str() {
+            openai_messages.push(json!({ "role": "system", "content": s }));
+        } else if let Some(arr) = sys.as_array() {
+            let sys_text = arr
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !sys_text.is_empty() {
+                openai_messages.push(json!({ "role": "system", "content": sys_text }));
+            }
+        }
+    }
+
+    // 2. Extract messages
+    if let Some(messages) = payload.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content_val = msg.get("content");
+            let text = if let Some(s) = content_val.and_then(|c| c.as_str()) {
+                s.to_string()
+            } else if let Some(arr) = content_val.and_then(|c| c.as_array()) {
+                arr.iter()
+                    .filter_map(|item| {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            item.get("text").and_then(|t| t.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+
+            openai_messages.push(json!({ "role": role, "content": text }));
+        }
+    }
+
+    // 3. If muse-spark model
+    if model.starts_with("muse-spark") {
+        let input_text = openai_messages
+            .iter()
+            .map(|m| format!("{}: {}", m["role"].as_str().unwrap_or("user"), m["content"].as_str().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let responses_payload = json!({
+            "model": model,
+            "input": input_text,
+            "stream": false
+        });
+
+        let mut req = state
+            .client
+            .post(format!("{}/responses", state.zen_base))
+            .header("User-Agent", &state.user_agent)
+            .header("Content-Type", "application/json")
+            .json(&responses_payload);
+
+        req = attach_headers(req, &headers);
+
+        return match req.send().await {
+            Ok(res) => {
+                if let Ok(resp_json) = res.json::<Value>().await {
+                    let mut text_output = String::new();
+                    if let Some(outputs) = resp_json.get("output").and_then(|o| o.as_array()) {
+                        for item in outputs {
+                            if item.get("type").and_then(|t| t.as_str()) == Some("message") {
+                                if let Some(contents) = item.get("content").and_then(|c| c.as_array()) {
+                                    for c in contents {
+                                        if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
+                                            text_output.push_str(text);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let anthropic_response = json!({
+                        "id": "msg_zen_muse",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [
+                            { "type": "text", "text": text_output }
+                        ],
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": { "input_tokens": 10, "output_tokens": 50 }
+                    });
+                    Json(anthropic_response).into_response()
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse muse response").into_response()
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": { "message": format!("Upstream request failed: {}", e) } })),
+            ).into_response(),
+        };
+    }
+
+    let openai_payload = json!({
+        "model": model,
+        "messages": openai_messages,
+        "stream": false
+    });
 
     let mut req = state
         .client
-        .post(format!("{}/messages", state.zen_base))
+        .post(format!("{}/chat/completions", state.zen_base))
         .header("User-Agent", &state.user_agent)
         .header("Content-Type", "application/json")
-        .json(&payload);
+        .json(&openai_payload);
 
-    req = attach_auth_headers(req, &headers);
+    req = attach_headers(req, &headers);
 
-    match req.send().await {
-        Ok(res) => forward_response(res),
+    let res = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": { "message": format!("Upstream request failed: {}", e) } })),
+            )
+                .into_response();
+        }
+    };
+
+    if !res.status().is_success() {
+        return forward_response(res);
+    }
+
+    match res.json::<Value>().await {
+        Ok(resp_json) => {
+            let id = resp_json.get("id").and_then(|i| i.as_str()).unwrap_or("msg_zen_adapted");
+            let text = resp_json
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c0| c0.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+
+            let input_tokens = resp_json
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0);
+            let output_tokens = resp_json
+                .get("usage")
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0);
+
+            if is_stream {
+                let sse_events = format!(
+                    "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+                    json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": format!("msg_{}", id),
+                            "type": "message",
+                            "role": "assistant",
+                            "model": model,
+                            "content": [],
+                            "stop_reason": null,
+                            "stop_sequence": null,
+                            "usage": { "input_tokens": input_tokens, "output_tokens": 1 }
+                        }
+                    }),
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" }
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "text_delta", "text": text }
+                    }),
+                    json!({
+                        "type": "content_block_stop",
+                        "index": 0
+                    }),
+                    json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                        "usage": { "output_tokens": output_tokens }
+                    }),
+                    json!({
+                        "type": "message_stop"
+                    })
+                );
+
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from(sse_events))
+                    .unwrap_or_default();
+            }
+
+            let anthropic_response = json!({
+                "id": format!("msg_{}", id),
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [
+                    { "type": "text", "text": text }
+                ],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens
+                }
+            });
+
+            Json(anthropic_response).into_response()
+        }
         Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": { "message": format!("Upstream request failed: {}", e) } })),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": { "message": format!("Failed to parse upstream response: {}", e) } })),
         )
             .into_response(),
     }
@@ -262,7 +504,6 @@ async fn handle_muse_conversion(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    // Extract conversation text from messages array for responses API input
     let mut input_text = String::new();
     if let Some(messages) = payload.get("messages").and_then(|m| m.as_array()) {
         for msg in messages {
@@ -299,7 +540,7 @@ async fn handle_muse_conversion(
         .header("Content-Type", "application/json")
         .json(&responses_payload);
 
-    req = attach_auth_headers(req, &headers);
+    req = attach_headers(req, &headers);
 
     let res = match req.send().await {
         Ok(r) => r,
@@ -317,11 +558,9 @@ async fn handle_muse_conversion(
     }
 
     if is_stream {
-        // Stream direct response
         return forward_response(res);
     }
 
-    // Convert /responses JSON output to standard chat.completion JSON
     match res.json::<Value>().await {
         Ok(resp_json) => {
             let id = resp_json
@@ -378,14 +617,26 @@ async fn handle_muse_conversion(
     }
 }
 
-fn clean_model_name(payload: &mut Value) {
+fn map_and_clean_model(payload: &mut Value) -> String {
     if let Some(m) = payload.get("model").and_then(|x| x.as_str()) {
-        let cleaned = m.replace("[1m]", "").replace("[128k]", "");
-        payload["model"] = Value::String(cleaned);
+        let mut cleaned = m.replace("[1m]", "").replace("[128k]", "");
+        if cleaned.starts_with("claude-3-7-sonnet") {
+            cleaned = "claude-sonnet-4-6".to_string();
+        } else if cleaned.starts_with("claude-3-5-sonnet") {
+            cleaned = "claude-sonnet-4-5".to_string();
+        } else if cleaned.starts_with("claude-3-5-haiku") {
+            cleaned = "claude-haiku-4-5".to_string();
+        } else if cleaned.starts_with("claude-3-opus") {
+            cleaned = "claude-opus-4-6".to_string();
+        }
+        payload["model"] = Value::String(cleaned.clone());
+        cleaned
+    } else {
+        String::new()
     }
 }
 
-fn attach_auth_headers(
+fn attach_headers(
     mut req: reqwest::RequestBuilder,
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
@@ -397,6 +648,12 @@ fn attach_auth_headers(
     }
     if let Some(api_key) = headers.get("api-key") {
         req = req.header("api-key", api_key);
+    }
+    if let Some(ver) = headers.get("anthropic-version") {
+        req = req.header("anthropic-version", ver);
+    }
+    if let Some(beta) = headers.get("anthropic-beta") {
+        req = req.header("anthropic-beta", beta);
     }
     req
 }
@@ -426,4 +683,3 @@ fn forward_response(res: reqwest::Response) -> Response {
             .into_response()
     })
 }
-
