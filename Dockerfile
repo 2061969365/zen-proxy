@@ -1,26 +1,28 @@
 # Build stage
-FROM rust:1.80-alpine AS builder
+FROM rust:1.80-slim-bookworm AS builder
 
 WORKDIR /usr/src/zen-proxy
 
-# Install build dependencies for Alpine
-RUN apk add --no-cache musl-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests
 COPY Cargo.toml ./
-
-# Copy source code
 COPY src ./src
 
-# Build release binary
 RUN cargo build --release
 
-# Final runtime stage
-FROM alpine:3.20
+# Runtime stage
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/zen-proxy/target/release/zen-proxy /app/zen-proxy
 
